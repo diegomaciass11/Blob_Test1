@@ -1,0 +1,4 @@
+streamlit
+pillow
+rembg
+azure-storage-blob
