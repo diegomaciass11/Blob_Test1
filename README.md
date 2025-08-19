@@ -10,9 +10,3 @@ Este proyecto es una app en **Streamlit** que:
 
 ---
 
-## 🚀 Instalación
-
-```bash
-git clone https://github.com/tuusuario/tu-repo.git
-cd tu-repo
-pip install -r requirements.txt
