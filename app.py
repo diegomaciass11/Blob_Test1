@@ -1,65 +1,85 @@
 import streamlit as st
 from rembg import remove
 from PIL import Image
-import io
+from io import BytesIO
 from azure.storage.blob import BlobServiceClient
-import os
+import uuid, re
 
-# 🔐 Configuración de conexión (en producción usa st.secrets o variables de entorno)
-AZURE_CONNECTION_STRING = st.secrets.get("AZURE_CONNECTION_STRING", "")
-CONTAINER_NAME = st.secrets.get("AZURE_CONTAINER_NAME", "imagenes")
+# ---- Funciones de arriba (pega aquí trim_alpha, to_square_contain, to_square_cover) ----
+# (omito por brevedad; pégalos exactamente como están)
 
-st.title("🖼️ Quitador de fondo + subida a Azure Blob")
+def sanitize_blob_name(name: str) -> str:
+    base = re.sub(r"\.[^.]+$", "", name).strip().replace(" ", "_")
+    base = re.sub(r"[^A-Za-z0-9_\-]", "", base)
+    return f"{base}_{uuid.uuid4().hex[:8]}.png"
 
-uploaded_file = st.file_uploader("Sube tu imagen", type=["jpg", "jpeg", "png"])
+st.set_page_config(page_title="600×600 sin deformar", layout="centered")
+st.title("🖼️ Quitar fondo → 600×600 sin deformar → (opcional) subir a Blob")
+
+colA, colB = st.columns(2)
+with colA:
+    modo = st.radio("Modo de encuadre", ["Contain (padding)", "Cover (recorte)"])
+with colB:
+    permitir_upscaling = st.checkbox("Permitir upscaling", value=False,
+                                     help="Desactívalo para NO agrandar imágenes pequeñas (mejor calidad).")
+
+fondo_transparente = st.checkbox("Fondo transparente (solo Contain)", value=True)
+
+uploaded_file = st.file_uploader("Sube tu imagen (JPG/PNG)", type=["jpg", "jpeg", "png"])
+
+# Azure secrets (opcional)
+azure_ok = False
+try:
+    CONNECTION_STRING = st.secrets["azure"]["connection_string"]
+    CONTAINER_NAME = st.secrets["azure"]["container_name"]
+    azure_ok = True
+except Exception:
+    pass  # si no hay credenciales, igual puedes descargar localmente
 
 if uploaded_file is not None:
-    # Abrimos la imagen
-    image = Image.open(uploaded_file).convert("RGBA")
-    st.image(image, caption="Imagen original", use_column_width=True)
+    original = Image.open(uploaded_file).convert("RGBA")
+    st.image(original, caption="Original (sin deformar)", use_container_width=True)
 
-    with st.spinner("Procesando imagen..."):
-        # 🔹 Remover fondo
-        result_image = remove(image)
-        # 🔹 Redimensionar a 600x600
-        resized_image = result_image.resize((600, 600), Image.LANCZOS)
+    with st.spinner("Procesando…"):
+        # 1) Quitar fondo
+        no_bg = remove(original)
+        # 2) Recortar bordes transparentes
+        no_bg = trim_alpha(no_bg)
 
-        st.image(resized_image, caption="Imagen sin fondo (600x600)", use_column_width=True)
-
-        # Guardamos en buffer en memoria
-        buffer = io.BytesIO()
-        resized_image.save(buffer, format="PNG")
-        buffer.seek(0)
-
-        # 👉 Botón de descarga
-        st.download_button(
-            label="📥 Descargar imagen procesada",
-            data=buffer,
-            file_name="imagen_sin_fondo_600x600.png",
-            mime="image/png"
-        )
-
-        # 👉 Subida a Azure Blob
-        if AZURE_CONNECTION_STRING != "":
-            try:
-                st.write("🔄 Subiendo imagen al blob storage...")
-
-                # Cliente de Azure
-                blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONNECTION_STRING)
-                blob_client = blob_service_client.get_blob_client(
-                    container=CONTAINER_NAME,
-                    blob=uploaded_file.name.replace(" ", "_")
-                )
-
-                # Regresamos buffer al inicio antes de subir
-                buffer.seek(0)
-                blob_client.upload_blob(buffer, overwrite=True)
-
-                blob_url = blob_client.url
-                st.success("✅ Imagen subida con éxito a Azure Blob Storage.")
-                st.markdown(f"[🔗 Ver imagen en Azure]({blob_url})")
-
-            except Exception as e:
-                st.error(f"❌ Error al subir a Azure: {e}")
+        # 3) Encajar sin deformar a 600×600
+        if modo.startswith("Contain"):
+            bg = (255, 255, 255, 0) if fondo_transparente else (255, 255, 255, 255)
+            final_img = to_square_contain(no_bg, size=600, allow_upscale=permitir_upscaling, bg=bg)
         else:
-            st.warning("⚠️ No se configuró la conexión a Azure. Agrega tu connection string en `st.secrets`.")
+            final_img = to_square_cover(no_bg, size=600, allow_upscale=permitir_upscaling)
+
+    st.image(final_img, caption="Resultado 600×600 (sin deformar)", use_container_width=True)
+
+    # 4) Guardado PNG optimizado (sin perder calidad visual)
+    buf = BytesIO()
+    # Para PNG: optimize=True intenta mejor compresión sin afectar nitidez
+    final_img.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+
+    st.download_button("⬇️ Descargar PNG 600×600", data=buf,
+                       file_name="imagen_600x600.png", mime="image/png")
+
+    # 5) Subir a Azure Blob (opcional)
+    if azure_ok and st.button("☁️ Subir a Azure Blob"):
+        try:
+            blob_service = BlobServiceClient.from_connection_string(CONNECTION_STRING)
+            container_client = blob_service.get_container_client(CONTAINER_NAME)
+
+            blob_name = sanitize_blob_name(uploaded_file.name)
+            blob_client = container_client.get_blob_client(blob=blob_name)
+
+            buf.seek(0)
+            blob_client.upload_blob(buf, overwrite=True)
+
+            account_url = blob_service.url
+            public_url = f"{account_url}/{CONTAINER_NAME}/{blob_name}"
+            st.success("✅ Subida correcta.")
+            st.code(public_url)
+        except Exception as e:
+            st.error(f"❌ Error al subir: {e}")
+
