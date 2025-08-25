@@ -1,4 +1,5 @@
 streamlit
 pillow
 rembg
+onnxruntime
 azure-storage-blob
